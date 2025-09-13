@@ -1,63 +1,53 @@
 import express from "express";
 import { spawn } from "child_process";
-import fs from "fs";
-import path from "path";
-import os from "os";
+import { tmpdir } from "os";
+import { join } from "path";
+import { mkdir, rm } from "fs/promises";
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const BASE = path.join(os.tmpdir(), "mkv-hls");
-if (!fs.existsSync(BASE)) fs.mkdirSync(BASE, { recursive: true });
-
-function genId() {
-  return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2,8);
-}
 
 app.get("/stream", async (req, res) => {
-  const mkvUrl = req.query.url;
-  if (!mkvUrl) return res.status(400).send("Missing url parameter");
+  const url = req.query.url;
+  if (!url) return res.status(400).send("Missing ?url param");
 
-  const id = genId();
-  const dir = path.join(BASE, id);
-  fs.mkdirSync(dir, { recursive: true });
+  // Temporary folder for this stream
+  const id = Date.now().toString();
+  const outDir = join(tmpdir(), id);
+  await mkdir(outDir);
 
-  const playlist = path.join(dir, "index.m3u8");
-  const segmentPattern = path.join(dir, "segment-%05d.ts");
+  console.log("Starting ffmpeg for:", url);
 
-  const args = [
-    "-y",
-    "-i", mkvUrl,
-    "-map", "0",
+  // ffmpeg command with all fixes
+  const ffmpeg = spawn("ffmpeg", [
+    "-i", url,
     "-c:v", "copy",
-    "-c:a", "aac",
-    "-b:a", "128k",
-    "-c:s", "webvtt",
-    "-f", "hls",
+    "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+    "-scodec", "webvtt",
+    "-hls_playlist_type", "vod",
     "-hls_time", "6",
-    "-hls_list_size", "0",
-    "-hls_segment_filename", segmentPattern,
-    playlist
-  ];
+    join(outDir, "index.m3u8")
+  ]);
 
-  const ff = spawn("ffmpeg", args);
-  ff.stderr.on("data", d => console.log(d.toString()));
+  ffmpeg.stderr.on("data", data => console.log(data.toString()));
 
-  const waitForFile = () => new Promise(resolve => {
-    const start = Date.now();
-    const iv = setInterval(() => {
-      if (fs.existsSync(playlist)) { clearInterval(iv); resolve(true); }
-      if (Date.now() - start > 10000) { clearInterval(iv); resolve(false); }
-    }, 300);
-  });
+  ffmpeg.on("close", code => console.log("FFmpeg exited with code", code));
 
-  const ok = await waitForFile();
-  if (!ok) return res.status(500).send("Failed to create playlist");
-
-  const host = req.headers.host;
-  const proto = req.headers["x-forwarded-proto"] || "https";
-  res.redirect(`${proto}://${host}/hls/${id}/index.m3u8`);
+  // Wait a few seconds to generate initial segments before redirect
+  setTimeout(() => {
+    res.redirect(`/hls/${id}/index.m3u8`);
+  }, 5000);
 });
 
-app.use("/hls", express.static(BASE));
+// Serve HLS output
+app.use("/hls", express.static(tmpdir()));
 
-app.listen(PORT, () => console.log(`Listening on ${PORT}`));
+// Cleanup old streams every hour
+setInterval(async () => {
+  try {
+    await rm(tmpdir(), { recursive: true, force: true });
+  } catch (e) {
+    console.error("Cleanup error:", e);
+  }
+}, 3600000);
+
+app.listen(3000, () => console.log("Server running on port 3000"));
